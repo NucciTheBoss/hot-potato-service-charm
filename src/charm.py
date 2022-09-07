@@ -31,6 +31,7 @@ from ops.model import ActiveStatus, Unit
 logger = logging.getLogger(__name__)
 
 
+# TODO: Move forward method into RelationChanged and start action handler.
 class Forward:
     @staticmethod
     def forward(
@@ -38,7 +39,7 @@ class Forward:
     ) -> Union[dict, None]:
         """Recursive function to proceed through hot potato forward table."""
 
-        logger.info("Inside forward.")
+        logger.info(f"Inside forward. ID of token: {id(token)}")
 
         delay = kwargs.get("delay", 0)
         max_passes = kwargs.get("max_passes", None)
@@ -81,7 +82,7 @@ class Forward:
                 )
             else:
                 # Return new token
-                return
+                return token
 
 
 class HotPotatoSuperInterface(RelationSuperInterface):
@@ -106,6 +107,7 @@ class HotPotatoCharm(ServiceCharm):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.i = HotPotatoSuperInterface(self, "players", role="peer")
         self.framework.observe(
             self.on.players_relation_joined, self._on_players_relation_join
         )
@@ -143,6 +145,7 @@ class HotPotatoCharm(ServiceCharm):
 
     def _on_players_relation_changed(self, event: RelationChangedEvent) -> None:
         """When data in players has changed."""
+        logger.info("Event detected.")
         if (
             "message" not in event.relation.data[event.unit]
             or event.relation.data[event.unit].get("message") == ""
@@ -150,31 +153,31 @@ class HotPotatoCharm(ServiceCharm):
             logger.info("Key 'message' is not present or is empty in message.")
             return
         else:
-            si = HotPotatoSuperInterface(self, "players", "peer")
-            token = si.select(self.unit)
+            token = self.i.select(event.unit)
+            logger.info(f"Token message: {token.message}")
             r = self.model.relations.get("players")[0]
             peers = [self.unit.name] + [u.name for u in r.units]
             delay = self._stored.bucket[self._DELAY_KEY]
             max_passes = self._stored.bucket[self._PASSES_KEY]
-            return Forward.forward(token, peers, self.unit, delay=delay, max_passes=max_passes)
+            return Forward.forward(
+                token, peers, self.unit, delay=delay, max_passes=max_passes
+            )
 
     def _on_start_action(self, event: ActionEvent) -> None:
         """Handler for when start action is invoked."""
-        logger.info("Constructing message and mapping peer topology.")
+        r = self.model.relations.get("players")[0]
         delay = self._stored.bucket[self._DELAY_KEY]
         max_passes = self._stored.bucket[self._PASSES_KEY]
-        r = self.model.relations.get("players")[0]
         peers = [self.unit.name] + [u.name for u in r.units]
-        si = HotPotatoSuperInterface(self, "players", role="peer")
-        token = si.select(self.unit)
+        token = self.i.select(self.unit)
         token.message = event.params["token"]
         token.holder = peers[random.randint(0, len(peers) - 1)]
         token.times_passed = 0
         token.time_elapsed = 0.0
         token.timestamp = time.time()
-        logger.info("Running forward action")
-        # See if return helps fix the issue?
-        return Forward.forward(token, peers, self.unit, delay=delay, max_passes=max_passes)
+        logger.info(f"ID of token: {id(token)}")
+        if token.holder == self.unit.name:
+            Forward.forward(token, peers, self.unit, delay=delay, max_passes=max_passes)
 
 
 if __name__ == "__main__":
