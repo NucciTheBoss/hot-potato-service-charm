@@ -2,7 +2,7 @@
 # See LICENSE file for licensing details.
 
 # For Hot-Potato
-start:
+ping:
   description: >
     Start a game of hot potato with the other units in the model.
   params:
