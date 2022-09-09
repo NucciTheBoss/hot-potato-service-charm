@@ -7,26 +7,69 @@
 import logging
 import random
 import time
+from typing import Any, List
 
-from hpctlib.interface import checker
-from hpctlib.interface import codec
+from hpctlib.interface import checker, codec, interface_registry
 from hpctlib.interface.base import Value
 from hpctlib.interface.relation import RelationSuperInterface, UnitBucketInterface
 from hpctlib.ops.charm.service import ServiceCharm
 from ops.charm import (
     ActionEvent,
     ConfigChangedEvent,
-    InstallEvent,
     RelationChangedEvent,
     RelationDepartedEvent,
     RelationJoinedEvent,
 )
 from ops.framework import StoredState
 from ops.main import main
-from ops.model import ActiveStatus
+from ops.model import ActiveStatus, Unit
 
 
 logger = logging.getLogger(__name__)
+
+
+class Forward:
+    @staticmethod
+    def forward(
+        token: Any, peers: List[str], unit: Unit, bucket: Any, **kwargs
+    ) -> None:
+        """Recursive function to proceed through hot potato forward table."""
+
+        if (max_passes := kwargs.get("max_passes", None)) is not None:
+            if token.times_passed == max_passes and token.holder == unit.name:
+                unit.status = ActiveStatus(
+                    (
+                        "Maximum passes reached. "
+                        f"Time to completion is {token.time_elapsed:.2f} seconds."
+                    )
+                )
+                return
+
+        if token.holder == unit.name:
+            unit.status = ActiveStatus(
+                (
+                    f"M: {token.message}, "
+                    f"H: {token.holder}, "
+                    f"P: {token.times_passed}, "
+                    f"T: {token.time_elapsed:.2f}"
+                )
+            )
+            if (delay := kwargs.get("delay", 0)) > 0:
+                time.sleep(delay)
+            bucket.message = token.message
+            bucket.holder = peers[random.randint(0, len(peers) - 1)]
+            bucket.times_passed = token.times_passed + 1
+            timestamp = time.time()
+            bucket.time_elapsed = token.time_elapsed + (timestamp - token.timestamp)
+            bucket.timestamp = timestamp
+            unit.status = ActiveStatus()
+
+            # Check if the next destination is the same unit.
+            if bucket.holder == unit.name:
+                # If so, run forward again
+                return Forward.forward(
+                    token, peers, unit, bucket, delay=delay, max_passes=max_passes
+                )
 
 
 class HotPotatoSuperInterface(RelationSuperInterface):
@@ -51,6 +94,9 @@ class HotPotatoCharm(ServiceCharm):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+
+        self.i = interface_registry.load("relation-players", self, "players")
+
         self.framework.observe(
             self.on.players_relation_joined, self._on_players_relation_join
         )
@@ -61,10 +107,8 @@ class HotPotatoCharm(ServiceCharm):
             self.on.players_relation_changed, self._on_players_relation_changed
         )
         self.framework.observe(self.on.ping_action, self._on_ping_action)
-        self._stored.set_default(bucket={self._PASSES_KEY: None, self._DELAY_KEY: 0})
 
-    def _service_install(self, event: InstallEvent) -> None:
-        self.unit.status = ActiveStatus()
+        self._stored.set_default(bucket={self._PASSES_KEY: None, self._DELAY_KEY: 0})
 
     def _service_on_config_changed(self, event: ConfigChangedEvent) -> None:
         """When the configuration of the service is updated."""
@@ -92,73 +136,36 @@ class HotPotatoCharm(ServiceCharm):
             or event.relation.data[event.unit].get("message") == ""
         ):
             logger.info("Key 'message' is not present or is empty in message.")
-            return
         else:
-            i = HotPotatoSuperInterface(self, "players", role="peer")
-            old_token = i.select(event.unit)
-            new_token = i.select(self.unit)
-
-            if (max_passes := self._stored.bucket[self._PASSES_KEY]) is not None:
-                if old_token.times_passed == max_passes and old_token.holder == self.unit.name:
-                    logger.info("Max passes reached.")
-                    self.unit.status = ActiveStatus(
-                        (
-                            "Maximum passes reached. "
-                            f"Time to completion is {old_token.time_elapsed:.2f} seconds."
-                        )
-                    )
-                    return
-
-            if old_token.holder != self.unit.name:
-                if old_token.holder == event.unit.name:
-                    logger.info(
-                        f"Sending token back to {event.unit.name} for processing."
-                    )
-                    new_token.message = old_token.message
-                    new_token.holder = old_token.holder
-                    new_token.times_passed = old_token.times_passed
-                    timestamp = time.time()
-                    new_token.time_elapsed = timestamp - old_token.timestamp
-                    new_token.timestamp = timestamp
-                else:
-                    return
-            else:
-                logger.info(f"Token being processed by unit {self.unit.name}")
-                self.unit.status = ActiveStatus(
-                    (
-                        f"M: {old_token.message}, "
-                        f"H: {old_token.holder}, "
-                        f"P: {old_token.times_passed}, "
-                        f"T: {old_token.time_elapsed:.2f}"
-                    )
-                )
-
-                if (delay := self._stored.bucket[self._DELAY_KEY]) > 0:
-                    time.sleep(delay)
-
-                self.unit.status = ActiveStatus()
-                r = self.model.get_relation("players")
-                peers = [self.unit.name] + [u.name for u in r.units]
-                new_token.message = old_token.message
-                new_token.holder = peers[random.randint(0, len(peers) - 1)]
-                new_token.times_passed = old_token.times_passed + 1
-                timestamp = time.time()
-                new_token.time_elapsed += timestamp - old_token.timestamp
-                new_token.timestamp = timestamp
+            recv_token = self.i.select(event.unit)
+            bucket = self.i.select(self.unit)
+            r = self.model.get_relation("players")
+            peers = [self.unit.name] + [u.name for u in r.units]
+            delay = self._stored.bucket[self._DELAY_KEY]
+            max_passes = self._stored.bucket[self._PASSES_KEY]
+            Forward.forward(
+                recv_token, peers, self.unit, bucket, delay=delay, max_passes=max_passes
+            )
 
     def _on_ping_action(self, event: ActionEvent) -> None:
         """Handler for when start action is invoked."""
-        logger.info("Received an action.")
-        i = HotPotatoSuperInterface(self, "players", role="peer")
+        logger.info("Constructing message and mapping peer topology.")
+        delay = self._stored.bucket[self._DELAY_KEY]
+        max_passes = self._stored.bucket[self._PASSES_KEY]
         r = self.model.get_relation("players")
         peers = [self.unit.name] + [u.name for u in r.units]
-        token = i.select(self.unit)
+        token = self.i.select(self.unit)
         token.message = event.params["token"]
         token.holder = peers[random.randint(0, len(peers) - 1)]
         token.times_passed = 0
         token.time_elapsed = 0.0
         token.timestamp = time.time()
+        Forward.forward(
+            token, peers, self.unit, token, delay=delay, max_passes=max_passes
+        )
 
 
 if __name__ == "__main__":
+    interface_registry.register("relation-players", HotPotatoSuperInterface)
+
     main(HotPotatoCharm)

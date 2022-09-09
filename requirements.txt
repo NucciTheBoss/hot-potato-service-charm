@@ -1,4 +1,2 @@
---extra-index-url http://10.152.28.227:8080
---trusted-host 10.152.28.227
-hpctlib
+hpctlib == 0.1.0
 ops >= 1.4.0
